@@ -1,0 +1,18 @@
+# YOLO dataset configuration
+# Exact structure that YOLO expects
+path: /mnt/34B471F7B471BBC4/CSO_project/datasets
+
+# YOLO expects these exact directory names
+train: images/train
+val: images/val
+
+# Number of classes
+nc: 30
+
+# Class names
+names: ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 
+        'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench',
+        'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+        'backpack', 'umbrella', 'handbag', 'tie',
+        'skis', 'snowboard', 'sports ball', 'kite',
+        'banana', 'apple', 'sandwich']
