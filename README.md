@@ -63,27 +63,27 @@ pip install -r requirements.txt   # (if you create one)
 #### Dataset setup  
 Edit `coco_yolo_exact.yaml` to point to your dataset(s). For conversion/preparation run:  
 ```bash
-python dataset_setup.py --config coco_yolo_exact.yaml  
+python dataset_setup.py   
 ```
 This will prepare the training/validation splits and annotations.
 
 #### Training the model  
 Once dataset is prepared, start training using:  
 ```bash
-python train_final_yolo.py --config coco_yolo_exact.yaml  
+python train_final_yolo.py  
 ```
 You can monitor loss, metrics and save checkpoints.
 
 #### Real-time detection  
 After model is trained (or use a pre-trained model), run the real-time script:  
 ```bash
-python real_time.py --weights path/to/model_weights.pt --config coco_yolo_exact.yaml  
+python real_time.py   
 ```
 This will start detection via webcam or video feed and display bounding-boxes, object labels, and confidence scores.
 
 You may also start the web/app interface via:  
 ```bash
-python app.py  
+streamlit run app.py 
 ```
 Then open your browser at `http://localhost:5000` (or appropriate port) to use the model from a UI.
 
