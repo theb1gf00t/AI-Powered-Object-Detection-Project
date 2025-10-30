@@ -10,6 +10,11 @@ from collections import Counter, deque
 import psutil
 import subprocess
 import threading
+from collections import defaultdict
+import tempfile
+import os
+import cv2  # ✅ ADD THIS
+import torch  # ✅ ADD THIS
 
 st.set_page_config(page_title="YOLO Detection Dashboard", layout="wide")
 
@@ -19,7 +24,301 @@ def load_model():
 
 model = load_model()
 
-# System Monitor Class
+class DistanceEstimator:
+    def __init__(self, focal_length=1200, real_height=1.5):
+        self.focal_length = focal_length
+        self.real_height = real_height
+    
+    def estimate_distance(self, bbox):
+        bbox_height = bbox[3] - bbox[1]
+        if bbox_height > 0:
+            distance = (self.real_height * self.focal_length) / bbox_height
+            return distance
+        return None
+
+
+class CollisionDetector:
+    def __init__(self, fps=30):
+        self.fps = fps
+        self.track_history = defaultdict(list)
+        self.CRITICAL_TTC = 1.5
+        self.WARNING_TTC = 3.0
+        self.CAUTION_TTC = 5.0
+        
+    def update_track(self, track_id, distance, timestamp):
+        self.track_history[track_id].append({
+            'distance': distance,
+            'time': timestamp
+        })
+        if len(self.track_history[track_id]) > 10:
+            self.track_history[track_id].pop(0)
+    
+    def calculate_speed(self, track_id):
+        history = self.track_history[track_id]
+        if len(history) < 2:
+            return 0
+        prev = history[-2]
+        curr = history[-1]
+        dist_change = prev['distance'] - curr['distance']
+        time_elapsed = curr['time'] - prev['time']
+        if time_elapsed > 0:
+            return dist_change / time_elapsed
+        return 0
+    
+    def calculate_ttc(self, distance, speed):
+        if speed <= 0:
+            return float('inf')
+        return distance / speed
+    
+    def assess_danger(self, ttc):
+        if ttc < self.CRITICAL_TTC:
+            return "CRITICAL", (0, 0, 255)
+        elif ttc < self.WARNING_TTC:
+            return "WARNING", (0, 165, 255)
+        elif ttc < self.CAUTION_TTC:
+            return "CAUTION", (0, 255, 255)
+        else:
+            return "SAFE", (0, 255, 0)
+
+
+def process_collision_video(video_path, model_path, focal_length=1200, progress_callback=None):
+    """
+    Comprehensive collision detection with all safety factors:
+    1. Distance estimation (from bounding box)
+    2. Relative speed calculation
+    3. Time-to-collision (TTC)
+    4. Low speed filter (too slow = no danger)
+    5. Safe distance threshold (far away = no danger)
+    6. Lane detection (other lane = no danger)
+    7. Ego speed factor (your speed affects safe distance)
+    """
+    
+    model = YOLO(model_path)
+    distance_est = DistanceEstimator(focal_length=focal_length)
+    collision_det = CollisionDetector()
+    
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # ========== SAFETY PARAMETERS ==========
+    
+    # Lane boundaries (your lane = center 40%)
+    YOUR_LANE_LEFT = int(width * 0.30)
+    YOUR_LANE_RIGHT = int(width * 0.70)
+    
+    # Speed thresholds
+    MIN_DANGER_SPEED = 3.0      # m/s (~11 km/h) - below this, no danger
+    SLOW_SPEED_THRESHOLD = 5.0  # m/s (~18 km/h) - slow approach
+    
+    # Distance thresholds
+    MIN_DETECTION_DISTANCE = 2.0   # m - too close, likely error
+    MAX_DETECTION_DISTANCE = 100.0 # m - too far to care
+    
+    # Ego speed estimation (from average scene motion)
+    ego_speed_history = deque(maxlen=30)  # Track your speed
+    ASSUMED_EGO_SPEED = 50.0 / 3.6  # Default: 50 km/h = 13.9 m/s
+    
+    # ========== OUTPUT SETUP ==========
+    output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    stats = {'warnings': 0, 'critical': 0, 'total_detections': 0, 'safe': 0}
+    frame_count = 0
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        current_time = frame_count / fps
+        frame_count += 1
+        
+        if progress_callback and frame_count % 10 == 0:
+            progress_callback(frame_count / total_frames)
+        
+        # Detect and track vehicles
+        results = model.track(frame, persist=True, classes=[2, 3, 5, 7], 
+                            verbose=False, conf=0.3)
+        
+        if results[0].boxes.id is not None:
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            track_ids = results[0].boxes.id.cpu().numpy()
+            
+            # Estimate ego speed from average vehicle speeds (simplified)
+            frame_speeds = []
+            
+            for box, track_id in zip(boxes, track_ids):
+                x1, y1, x2, y2 = box
+                track_id_int = int(track_id)
+                
+                # ========== FACTOR 6: LANE DETECTION ==========
+                box_center_x = (x1 + x2) / 2
+                box_width = x2 - x1
+                
+                # Check if vehicle center is in your lane
+                in_your_lane = YOUR_LANE_LEFT < box_center_x < YOUR_LANE_RIGHT
+                
+                # Also check if majority of vehicle is in your lane
+                vehicle_overlap = (
+                    min(x2, YOUR_LANE_RIGHT) - max(x1, YOUR_LANE_LEFT)
+                ) / box_width
+                
+                in_your_lane = in_your_lane and vehicle_overlap > 0.5
+                
+                if not in_your_lane:
+                    # Different lane - no danger, draw gray box
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), 
+                                (120, 120, 120), 1)
+                    continue
+                
+                # ========== FACTOR 1: DISTANCE ESTIMATION ==========
+                distance = distance_est.estimate_distance(box)
+                
+                # ========== FACTOR 5: DISTANCE RANGE CHECK ==========
+                if not distance or distance < MIN_DETECTION_DISTANCE or distance > MAX_DETECTION_DISTANCE:
+                    # Distance out of valid range
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), 
+                                (0, 255, 0), 1)
+                    continue
+                
+                # Track this vehicle
+                collision_det.update_track(track_id_int, distance, current_time)
+                
+                # ========== FACTOR 2: RELATIVE SPEED ==========
+                relative_speed = collision_det.calculate_speed(track_id_int)
+                
+                # Collect speeds for ego speed estimation
+                if abs(relative_speed) > 0.5:
+                    frame_speeds.append(abs(relative_speed))
+                
+                # ========== FACTOR 3: TIME TO COLLISION ==========
+                ttc = collision_det.calculate_ttc(distance, abs(relative_speed))
+                
+                # ========== FACTOR 7: EGO SPEED FACTOR ==========
+                # Estimate your speed from average vehicle motion
+                if frame_speeds:
+                    current_ego_speed = np.median(frame_speeds)
+                    ego_speed_history.append(current_ego_speed)
+                    ego_speed = np.mean(list(ego_speed_history))
+                else:
+                    ego_speed = ASSUMED_EGO_SPEED
+                
+                # Calculate safe distance based on your speed
+                # Rule: 1 second per 10 km/h (simplified 2-second rule)
+                ego_speed_kmh = ego_speed * 3.6
+                safe_distance = max(10.0, ego_speed_kmh / 3.6 * 2.0)  # 2-second rule
+                
+                # Adjust TTC thresholds based on ego speed
+                if ego_speed_kmh > 80:  # Highway speeds
+                    critical_ttc = 2.0
+                    warning_ttc = 4.0
+                elif ego_speed_kmh > 50:  # City fast
+                    critical_ttc = 1.5
+                    warning_ttc = 3.0
+                else:  # City slow
+                    critical_ttc = 1.0
+                    warning_ttc = 2.0
+                
+                # ========== FACTOR 4: LOW SPEED FILTER ==========
+                # If approaching too slowly, always safe
+                if relative_speed < MIN_DANGER_SPEED:
+                    status_text = "SAFE"
+                    text_color = (0, 255, 0)
+                    box_color = (0, 255, 0)
+                    stats['safe'] += 1
+                
+                # ========== COMBINED DANGER ASSESSMENT ==========
+                elif relative_speed >= MIN_DANGER_SPEED:
+                    # Vehicle approaching fast enough to matter
+                    
+                    # Check if distance is too small regardless of TTC
+                    if distance < safe_distance * 0.5:
+                        # Very close - critical
+                        status_text = "DANGER"
+                        text_color = (0, 0, 255)
+                        box_color = (0, 0, 255)
+                        stats['critical'] += 1
+                    
+                    elif ttc < critical_ttc:
+                        # Critical TTC
+                        status_text = "DANGER"
+                        text_color = (0, 0, 255)
+                        box_color = (0, 0, 255)
+                        stats['critical'] += 1
+                    
+                    elif ttc < warning_ttc or distance < safe_distance:
+                        # Warning TTC or below safe distance
+                        status_text = "WARNING"
+                        text_color = (0, 165, 255)
+                        box_color = (0, 165, 255)
+                        stats['warnings'] += 1
+                    
+                    elif relative_speed < SLOW_SPEED_THRESHOLD:
+                        # Approaching slowly
+                        status_text = "CAUTION"
+                        text_color = (0, 255, 255)
+                        box_color = (0, 255, 255)
+                        stats['warnings'] += 1
+                    
+                    else:
+                        # Safe
+                        status_text = "SAFE"
+                        text_color = (0, 255, 0)
+                        box_color = (0, 255, 0)
+                        stats['safe'] += 1
+                
+                else:
+                    # Not approaching
+                    status_text = "SAFE"
+                    text_color = (0, 255, 0)
+                    box_color = (0, 255, 0)
+                    stats['safe'] += 1
+                
+                stats['total_detections'] += 1
+                
+                # ========== VISUALIZATION ==========
+                # Draw bounding box
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), 
+                            box_color, 3)
+                
+                # Status label
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.7
+                thickness = 2
+                
+                (text_width, text_height), _ = cv2.getTextSize(
+                    status_text, font, font_scale, thickness
+                )
+                
+                y_pos = int(y1) - 15
+                
+                # Black background
+                cv2.rectangle(
+                    frame,
+                    (int(x1), y_pos - text_height - 10),
+                    (int(x1) + text_width + 10, y_pos + 5),
+                    (0, 0, 0),
+                    -1
+                )
+                
+                # Status text
+                cv2.putText(
+                    frame, status_text, (int(x1) + 5, y_pos),
+                    font, font_scale, text_color, thickness
+                )
+        
+        out.write(frame)
+    
+    cap.release()
+    out.release()
+    
+    return output_path, stats
+
+
 class SystemMonitor:
     def __init__(self):
         self.cpu_readings = deque()
@@ -88,9 +387,8 @@ class SystemMonitor:
 st.title("🔍 YOLO Object Detection Dashboard")
 st.markdown("**Fine-tuned YOLOv8s** on 30 COCO classes")
 
-tabs = st.tabs(["📷 Detection", "📊 Model Performance", "⚡ CPU vs GPU", "📈 Class Distribution", "🚀 Benchmark"])
+tabs = st.tabs(["📷 Detection", "📊 Model Performance", "⚡ CPU vs GPU", "📈 Class Distribution", "🚀 Benchmark", "Road Safety"])
 
-# TAB 1: Image Detection
 with tabs[0]:
     st.header("Image Upload & Detection")
     
@@ -139,7 +437,6 @@ with tabs[0]:
             
             st.markdown("---")
 
-# TAB 2: Model Performance
 with tabs[1]:
     st.header("Model Performance Metrics")
     
@@ -222,8 +519,6 @@ with tabs[1]:
         for c in classes[19:]: 
             st.markdown(f"• {c}")
 
-# TAB 3: CPU vs GPU Performance
-# TAB 3: CPU vs GPU Performance (FIXED VERSION)
 with tabs[2]:
     st.header("CPU vs GPU Performance Comparison")
     
@@ -239,20 +534,17 @@ with tabs[2]:
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # IMPORTANT: Load fresh model for GPU
             import torch
             torch.cuda.empty_cache()
             status_text.text("Loading GPU model...")
             gpu_model = YOLO('runs/detect/train7/weights/best.pt')
             gpu_model.to('cuda')
             
-            # GPU Warmup (more iterations)
             status_text.text("Warming up GPU...")
             for _ in range(3):
                 for img_path in all_images[:10]:
                     _ = gpu_model(str(img_path), device='cuda', verbose=False)
-            
-            # GPU Test
+        
             status_text.text("Testing on GPU...")
             gpu_times = []
             for i, img_path in enumerate(all_images):
@@ -261,22 +553,18 @@ with tabs[2]:
                 gpu_times.append(time.time() - start)
                 progress_bar.progress((i + 1) / (2 * len(all_images)))
             
-            # Clean up GPU model
             del gpu_model
             torch.cuda.empty_cache()
             
-            # Load fresh model for CPU
             status_text.text("Loading CPU model...")
             cpu_model = YOLO('runs/detect/train7/weights/best.pt')
             cpu_model.to('cpu')
             
-            # CPU Warmup
             status_text.text("Warming up CPU...")
             for _ in range(2):
                 for img_path in all_images[:10]:
                     _ = cpu_model(str(img_path), device='cpu', verbose=False)
             
-            # CPU Test
             status_text.text("Testing on CPU...")
             cpu_times = []
             for i, img_path in enumerate(all_images):
@@ -285,7 +573,6 @@ with tabs[2]:
                 cpu_times.append(time.time() - start)
                 progress_bar.progress((len(all_images) + i + 1) / (2 * len(all_images)))
             
-            # Clean up CPU model
             del cpu_model
             torch.cuda.empty_cache()
             
@@ -305,7 +592,6 @@ with tabs[2]:
                 st.metric("CPU Avg Time", f"{cpu_avg:.3f}s")
                 st.metric("CPU FPS", f"{1/cpu_avg:.1f}")
             
-            # Fixed speedup calculation
             if gpu_avg < cpu_avg:
                 speedup = cpu_avg / gpu_avg
                 st.success(f"🚀 GPU is **{speedup:.2f}x faster** than CPU!")
@@ -314,7 +600,6 @@ with tabs[2]:
                 st.warning(f"⚠️ GPU is **{slowdown:.2f}x slower** than CPU")
                 st.info(f"💡 GPU: {gpu_avg*1000:.1f}ms | CPU: {cpu_avg*1000:.1f}ms | Try increasing image count for better GPU utilization")
             
-            # Chart
             fig = go.Figure()
             fig.add_trace(go.Box(y=gpu_times, name='GPU', marker_color='#4ECDC4'))
             fig.add_trace(go.Box(y=cpu_times, name='CPU', marker_color='#FF6B6B'))
@@ -325,15 +610,12 @@ with tabs[2]:
             )
             st.plotly_chart(fig, use_container_width=True)
             
-            # Additional debugging info
             st.markdown("### Performance Details")
             st.markdown(f"- **GPU Min**: {min(gpu_times)*1000:.1f}ms | **Max**: {max(gpu_times)*1000:.1f}ms | **Std**: {np.std(gpu_times)*1000:.1f}ms")
             st.markdown(f"- **CPU Min**: {min(cpu_times)*1000:.1f}ms | **Max**: {max(cpu_times)*1000:.1f}ms | **Std**: {np.std(cpu_times)*1000:.1f}ms")
         else:
             st.error("No test images found!")
 
-
-# TAB 4: Class Distribution Analysis
 with tabs[3]:
     st.header("Class Detection Distribution")
     
@@ -431,7 +713,6 @@ with tabs[3]:
         else:
             st.error("No test images found!")
 
-# TAB 5: 4K Benchmark with System Monitoring
 with tabs[4]:
     st.header("🚀 Performance Benchmark")
     
@@ -549,3 +830,139 @@ with tabs[4]:
             
         else:
             st.error("No test images found!")
+
+with tabs[5]:  # Collision Detection Tab
+    st.header("🚗 Road Safety System")
+    st.markdown("""
+    Upload a dashcam video to detect vehicles and assess collision risks.
+    The system will:
+    - Detect and track vehicles (cars, trucks, buses, motorcycles)
+    - Estimate distance to each vehicle
+    - Calculate approaching speed
+    - Compute Time-to-Collision (TTC)
+    - Provide color-coded warnings:
+      - 🟢 **Green**: Safe
+      - 🟡 **Yellow**: Caution
+      - 🟠 **Orange**: Warning (TTC < 3s)
+      - 🔴 **Red**: Critical (TTC < 1.5s)
+    """)
+    
+    st.divider()
+    
+    # File uploader
+    uploaded_video = st.file_uploader(
+        "Upload Dashcam Video",
+        type=['mp4', 'mov', 'avi'],
+        help="Upload a video from your dashcam or driving footage"
+    )
+    
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        focal_length = st.slider(
+            "Camera Focal Length (pixels)",
+            min_value=200,
+            max_value=2400,
+            value=1200,
+            step=50,
+            help="Adjust based on your camera calibration"
+        )
+    
+    with col2:
+        process_button = st.button(
+            "🚀 Process Video",
+            type="primary",
+            disabled=uploaded_video is None
+        )
+    
+    if uploaded_video and process_button:
+        # Save uploaded video to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
+            tmp_file.write(uploaded_video.read())
+            temp_video_path = tmp_file.name
+        
+        st.info("🔄 Processing video... This may take a few minutes.")
+        
+        # Progress bar
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        def update_progress(progress):
+            progress_bar.progress(progress)
+            status_text.text(f"Processing: {int(progress*100)}%")
+        
+        try:
+            # Process video
+            output_path, stats = process_collision_video(
+                temp_video_path,
+                'runs/detect/train7/weights/best.pt',
+                progress_callback=update_progress
+            )
+            
+            progress_bar.progress(1.0)
+            status_text.text("Processing complete! ✅")
+            
+            st.success("✅ Video processed successfully!")
+            
+            # Display statistics
+            st.subheader("📊 Detection Statistics")
+            metric_col1, metric_col2, metric_col3 = st.columns(3)
+            
+            with metric_col1:
+                st.metric("Total Detections", stats['total_detections'])
+            with metric_col2:
+                st.metric("Warnings Issued", stats['warnings'], 
+                         delta="Caution/Warning")
+            with metric_col3:
+                st.metric("Critical Alerts", stats['critical'], 
+                         delta="Danger!", delta_color="inverse")
+            
+            st.divider()
+            
+            # Display output video
+            st.subheader("🎥 Processed Video")
+            
+            with open(output_path, 'rb') as video_file:
+                video_bytes = video_file.read()
+                st.video(video_bytes)
+            
+            # Download button
+            st.download_button(
+                label="💾 Download Processed Video",
+                data=video_bytes,
+                file_name="collision_detection_output.mp4",
+                mime="video/mp4"
+            )
+            
+            # Cleanup
+            os.unlink(temp_video_path)
+            os.unlink(output_path)
+            
+        except Exception as e:
+            st.error(f"❌ Error processing video: {str(e)}")
+            os.unlink(temp_video_path)
+    
+    elif not uploaded_video:
+        st.info("👆 Upload a dashcam video to get started")
+        
+        # Show example/demo
+        st.subheader("📖 How it Works")
+        st.markdown("""
+        **Distance Estimation:**
+        - Uses bounding box height and camera focal length
+        - Formula: `Distance = (Real Height × Focal Length) / Pixel Height`
+        
+        **Speed Calculation:**
+        - Tracks distance change over time
+        - Positive speed = vehicle approaching
+        
+        **Time-to-Collision (TTC):**
+        - Formula: `TTC = Distance / Speed`
+        - Warns when TTC is dangerously low
+        
+        **Color Coding:**
+        - Safe (Green): TTC > 5s or not approaching
+        - Caution (Yellow): 3s < TTC < 5s
+        - Warning (Orange): 1.5s < TTC < 3s
+        - Critical (Red): TTC < 1.5s
+        """)
