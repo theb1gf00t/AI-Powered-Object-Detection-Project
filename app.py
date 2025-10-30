@@ -25,6 +25,13 @@ def load_model():
 model = load_model()
 
 
+from collections import defaultdict, deque
+import numpy as np
+import cv2
+import tempfile
+from ultralytics import YOLO
+
+
 class DistanceEstimator:
     def __init__(self, focal_length=1200, real_height=1.5):
         self.focal_length = focal_length
@@ -98,14 +105,26 @@ class CollisionDetector:
         return distance / speed
     
     def assess_danger(self, ttc, speed, distance, safe_distance):
+        if distance > 25.0:
+            return "SAFE", (0, 255, 0)
+        
+        if speed < 5.0:
+            CRITICAL_TTC = 1.0
+            WARNING_TTC = 2.0
+            CAUTION_TTC = 3.5
+        else:
+            CRITICAL_TTC = self.CRITICAL_TTC
+            WARNING_TTC = self.WARNING_TTC
+            CAUTION_TTC = self.CAUTION_TTC
+
         if speed > self.MIN_SPEED_FOR_TTC:
             if distance < safe_distance * 0.5:
                 return "CRITICAL", (0, 0, 255)
-            elif ttc < self.CRITICAL_TTC:
+            elif ttc < CRITICAL_TTC:
                 return "CRITICAL", (0, 0, 255)
-            elif ttc < self.WARNING_TTC or distance < safe_distance:
+            elif ttc < WARNING_TTC or distance < safe_distance:
                 return "WARNING", (0, 165, 255)
-            elif ttc < self.CAUTION_TTC:
+            elif ttc < CAUTION_TTC:
                 return "CAUTION", (0, 255, 255)
         
         return "SAFE", (0, 255, 0)
@@ -163,7 +182,7 @@ def process_collision_video(video_path, model_path, focal_length=1200, progress_
     MAX_DETECTION_DISTANCE = 100.0
     
     ego_speed_history = deque(maxlen=60)
-    ASSUMED_EGO_SPEED = 50.0 / 3.6
+    ASSUMED_EGO_SPEED = 30.0 / 3.6
     ego_speed_decay = 0.95
     
     output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
@@ -263,10 +282,11 @@ def process_collision_video(video_path, model_path, focal_length=1200, progress_
                     else:
                         ego_speed = ASSUMED_EGO_SPEED
                 else:
-                    ego_speed = ASSUMED_EGO_SPEED
+                    ego_speed = 25.0/3.6
                 
                 ego_speed_kmh = ego_speed * 3.6
                 safe_distance = max(10.0, ego_speed_kmh / 3.6 * 2.0)
+                safe_distance = min(safe_distance, 35.0)
                 
                 ttc = collision_det.calculate_ttc(distance, abs(relative_speed))
                 
@@ -391,7 +411,7 @@ class SystemMonitor:
             'cpu_avg': cpu_avg,
             'ram_avg': ram_avg,
             'gpu_avg': gpu_avg,
-            'cpu_max': max(self.cpu_readings) if self.cpu_readings else 0,
+            'cpu_max':  (self.cpu_readings) if self.cpu_readings else 0,
             'ram_max': max(self.ram_readings) if self.ram_readings else 0,
             'gpu_max': max(self.gpu_readings) if self.gpu_readings else 0,
             'samples': len(self.cpu_readings)
