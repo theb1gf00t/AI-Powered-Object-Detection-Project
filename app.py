@@ -13,8 +13,8 @@ import threading
 from collections import defaultdict
 import tempfile
 import os
-import cv2  # ✅ ADD THIS
-import torch  # ✅ ADD THIS
+import cv2  
+import torch  
 
 st.set_page_config(page_title="YOLO Detection Dashboard", layout="wide")
 
@@ -24,16 +24,29 @@ def load_model():
 
 model = load_model()
 
+
 class DistanceEstimator:
     def __init__(self, focal_length=1200, real_height=1.5):
         self.focal_length = focal_length
         self.real_height = real_height
+        self.distance_history = defaultdict(lambda: deque(maxlen=5))
+        self.alpha = 0.8
     
-    def estimate_distance(self, bbox):
+    def estimate_distance(self, bbox, track_id):
         bbox_height = bbox[3] - bbox[1]
+        
         if bbox_height > 0:
-            distance = (self.real_height * self.focal_length) / bbox_height
-            return distance
+            raw_distance = (self.real_height * self.focal_length) / bbox_height
+            
+            if track_id in self.distance_history and len(self.distance_history[track_id]) > 0:
+                prev_distance = self.distance_history[track_id][-1]
+                smoothed_distance = self.alpha * prev_distance + (1 - self.alpha) * raw_distance
+            else:
+                smoothed_distance = raw_distance
+            
+            self.distance_history[track_id].append(smoothed_distance)
+            return smoothed_distance
+        
         return None
 
 
@@ -41,58 +54,82 @@ class CollisionDetector:
     def __init__(self, fps=30):
         self.fps = fps
         self.track_history = defaultdict(list)
+        self.lane_memory = {}
+        self.danger_state_history = defaultdict(lambda: deque(maxlen=5))
         self.CRITICAL_TTC = 1.5
         self.WARNING_TTC = 3.0
         self.CAUTION_TTC = 5.0
+        self.MIN_SPEED_FOR_TTC = 2.5
         
     def update_track(self, track_id, distance, timestamp):
         self.track_history[track_id].append({
             'distance': distance,
             'time': timestamp
         })
-        if len(self.track_history[track_id]) > 10:
+        if len(self.track_history[track_id]) > 15:
             self.track_history[track_id].pop(0)
     
     def calculate_speed(self, track_id):
         history = self.track_history[track_id]
-        if len(history) < 2:
+        
+        if len(history) < 5:
             return 0
-        prev = history[-2]
-        curr = history[-1]
-        dist_change = prev['distance'] - curr['distance']
-        time_elapsed = curr['time'] - prev['time']
-        if time_elapsed > 0:
-            return dist_change / time_elapsed
+        
+        speeds = []
+        N = min(5, len(history) - 1)
+        
+        for i in range(-N, 0):
+            d1 = history[i - 1]['distance']
+            d2 = history[i]['distance']
+            t1 = history[i - 1]['time']
+            t2 = history[i]['time']
+            
+            if t2 > t1:
+                speed = (d1 - d2) / (t2 - t1)
+                speeds.append(speed)
+        
+        if speeds:
+            return float(np.median(speeds))
         return 0
     
     def calculate_ttc(self, distance, speed):
-        if speed <= 0:
+        if speed <= self.MIN_SPEED_FOR_TTC:
             return float('inf')
         return distance / speed
     
-    def assess_danger(self, ttc):
-        if ttc < self.CRITICAL_TTC:
-            return "CRITICAL", (0, 0, 255)
-        elif ttc < self.WARNING_TTC:
-            return "WARNING", (0, 165, 255)
-        elif ttc < self.CAUTION_TTC:
-            return "CAUTION", (0, 255, 255)
-        else:
-            return "SAFE", (0, 255, 0)
+    def assess_danger(self, ttc, speed, distance, safe_distance):
+        if speed > self.MIN_SPEED_FOR_TTC:
+            if distance < safe_distance * 0.5:
+                return "CRITICAL", (0, 0, 255)
+            elif ttc < self.CRITICAL_TTC:
+                return "CRITICAL", (0, 0, 255)
+            elif ttc < self.WARNING_TTC or distance < safe_distance:
+                return "WARNING", (0, 165, 255)
+            elif ttc < self.CAUTION_TTC:
+                return "CAUTION", (0, 255, 255)
+        
+        return "SAFE", (0, 255, 0)
+    
+    def apply_temporal_hysteresis(self, track_id, new_state):
+        self.danger_state_history[track_id].append(new_state)
+        
+        if len(self.danger_state_history[track_id]) >= 3:
+            recent_states = list(self.danger_state_history[track_id])[-3:]
+            if all(s == new_state for s in recent_states):
+                return new_state
+        
+        if len(self.danger_state_history[track_id]) > 1:
+            return self.danger_state_history[track_id][-2]
+        
+        return new_state
+    
+    def remember_lane(self, track_id, in_lane):
+        if track_id not in self.lane_memory:
+            self.lane_memory[track_id] = in_lane
+        return self.lane_memory[track_id]
 
 
 def process_collision_video(video_path, model_path, focal_length=1200, progress_callback=None):
-    """
-    Comprehensive collision detection with all safety factors:
-    1. Distance estimation (from bounding box)
-    2. Relative speed calculation
-    3. Time-to-collision (TTC)
-    4. Low speed filter (too slow = no danger)
-    5. Safe distance threshold (far away = no danger)
-    6. Lane detection (other lane = no danger)
-    7. Ego speed factor (your speed affects safe distance)
-    """
-    
     model = YOLO(model_path)
     distance_est = DistanceEstimator(focal_length=focal_length)
     collision_det = CollisionDetector()
@@ -103,25 +140,32 @@ def process_collision_video(video_path, model_path, focal_length=1200, progress_
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # ========== SAFETY PARAMETERS ==========
+    YOUR_LANE_LEFT = int(width * 0.35)
+    YOUR_LANE_RIGHT = int(width * 0.65)
     
-    # Lane boundaries (your lane = center 40%)
-    YOUR_LANE_LEFT = int(width * 0.30)
-    YOUR_LANE_RIGHT = int(width * 0.70)
+    HOOD_ZONE = {
+        "x1": int(width * 0.35),
+        "x2": int(width * 0.65),
+        "y1": int(height * 0.70),
+        "y2": int(height * 0.95)
+    }
     
-    # Speed thresholds
-    MIN_DANGER_SPEED = 3.0      # m/s (~11 km/h) - below this, no danger
-    SLOW_SPEED_THRESHOLD = 5.0  # m/s (~18 km/h) - slow approach
+    MAX_BOX_WIDTH_RATIO = 0.25
+    MAX_BOX_HEIGHT_RATIO = 0.35
+    MIN_BOX_WIDTH = 50
+    MIN_BOX_HEIGHT = 50
+    MAX_ASPECT_RATIO = 2.5
+    MIN_ASPECT_RATIO = 0.5
+    MAX_AREA_RATIO = 0.08
     
-    # Distance thresholds
-    MIN_DETECTION_DISTANCE = 2.0   # m - too close, likely error
-    MAX_DETECTION_DISTANCE = 100.0 # m - too far to care
+    MIN_DANGER_SPEED = 2.5
+    MIN_DETECTION_DISTANCE = 3.0
+    MAX_DETECTION_DISTANCE = 100.0
     
-    # Ego speed estimation (from average scene motion)
-    ego_speed_history = deque(maxlen=30)  # Track your speed
-    ASSUMED_EGO_SPEED = 50.0 / 3.6  # Default: 50 km/h = 13.9 m/s
+    ego_speed_history = deque(maxlen=60)
+    ASSUMED_EGO_SPEED = 50.0 / 3.6
+    ego_speed_decay = 0.95
     
-    # ========== OUTPUT SETUP ==========
     output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
@@ -140,152 +184,123 @@ def process_collision_video(video_path, model_path, focal_length=1200, progress_
         if progress_callback and frame_count % 10 == 0:
             progress_callback(frame_count / total_frames)
         
-        # Detect and track vehicles
         results = model.track(frame, persist=True, classes=[2, 3, 5, 7], 
-                            verbose=False, conf=0.3)
+                            verbose=False, conf=0.45, iou=0.3)
         
         if results[0].boxes.id is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
             track_ids = results[0].boxes.id.cpu().numpy()
+            confidences = results[0].boxes.conf.cpu().numpy()
             
-            # Estimate ego speed from average vehicle speeds (simplified)
             frame_speeds = []
             
-            for box, track_id in zip(boxes, track_ids):
+            for box, track_id, conf in zip(boxes, track_ids, confidences):
                 x1, y1, x2, y2 = box
                 track_id_int = int(track_id)
                 
-                # ========== FACTOR 6: LANE DETECTION ==========
-                box_center_x = (x1 + x2) / 2
+                center_x = (x1 + x2) / 2
+                center_y = (y1 + y2) / 2
+                
+                if (HOOD_ZONE["x1"] < center_x < HOOD_ZONE["x2"]) and \
+                   (HOOD_ZONE["y1"] < center_y < HOOD_ZONE["y2"]):
+                    continue
+                
                 box_width = x2 - x1
+                box_height = y2 - y1
                 
-                # Check if vehicle center is in your lane
-                in_your_lane = YOUR_LANE_LEFT < box_center_x < YOUR_LANE_RIGHT
+                if (y2 > height * 0.80) or \
+                   (box_height > height * 0.45) or \
+                   (y2 > height * 0.75 and (width * 0.3 < center_x < width * 0.7)):
+                    continue
                 
-                # Also check if majority of vehicle is in your lane
-                vehicle_overlap = (
-                    min(x2, YOUR_LANE_RIGHT) - max(x1, YOUR_LANE_LEFT)
-                ) / box_width
+                width_ratio = box_width / width
+                height_ratio = box_height / height
+                box_area = box_width * box_height
+                frame_area = width * height
+                area_ratio = box_area / frame_area
                 
-                in_your_lane = in_your_lane and vehicle_overlap > 0.5
+                if (width_ratio > MAX_BOX_WIDTH_RATIO or 
+                    height_ratio > MAX_BOX_HEIGHT_RATIO or
+                    area_ratio > MAX_AREA_RATIO or
+                    box_width < MIN_BOX_WIDTH or
+                    box_height < MIN_BOX_HEIGHT):
+                    continue
+                
+                aspect_ratio = box_width / box_height if box_height > 0 else 0
+                if aspect_ratio > MAX_ASPECT_RATIO or aspect_ratio < MIN_ASPECT_RATIO:
+                    continue
+                
+                box_center_x = (x1 + x2) / 2
+                overlap_left = max(x1, YOUR_LANE_LEFT)
+                overlap_right = min(x2, YOUR_LANE_RIGHT)
+                overlap_width = max(0, overlap_right - overlap_left)
+                overlap_ratio = overlap_width / box_width
+                
+                in_your_lane = (YOUR_LANE_LEFT < box_center_x < YOUR_LANE_RIGHT) and (overlap_ratio > 0.7)
+                in_your_lane = collision_det.remember_lane(track_id_int, in_your_lane)
                 
                 if not in_your_lane:
-                    # Different lane - no danger, draw gray box
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), 
-                                (120, 120, 120), 1)
                     continue
                 
-                # ========== FACTOR 1: DISTANCE ESTIMATION ==========
-                distance = distance_est.estimate_distance(box)
+                distance = distance_est.estimate_distance(box, track_id_int)
                 
-                # ========== FACTOR 5: DISTANCE RANGE CHECK ==========
                 if not distance or distance < MIN_DETECTION_DISTANCE or distance > MAX_DETECTION_DISTANCE:
-                    # Distance out of valid range
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), 
-                                (0, 255, 0), 1)
                     continue
                 
-                # Track this vehicle
                 collision_det.update_track(track_id_int, distance, current_time)
-                
-                # ========== FACTOR 2: RELATIVE SPEED ==========
                 relative_speed = collision_det.calculate_speed(track_id_int)
                 
-                # Collect speeds for ego speed estimation
                 if abs(relative_speed) > 0.5:
                     frame_speeds.append(abs(relative_speed))
                 
-                # ========== FACTOR 3: TIME TO COLLISION ==========
-                ttc = collision_det.calculate_ttc(distance, abs(relative_speed))
-                
-                # ========== FACTOR 7: EGO SPEED FACTOR ==========
-                # Estimate your speed from average vehicle motion
                 if frame_speeds:
-                    current_ego_speed = np.median(frame_speeds)
-                    ego_speed_history.append(current_ego_speed)
-                    ego_speed = np.mean(list(ego_speed_history))
+                    current_ego_estimate = np.median(frame_speeds)
+                    ego_speed_history.append(current_ego_estimate)
+                    
+                    if len(ego_speed_history) > 10:
+                        ego_speed = np.mean(list(ego_speed_history))
+                        ego_speed = ego_speed_decay * ego_speed + (1 - ego_speed_decay) * ASSUMED_EGO_SPEED
+                    else:
+                        ego_speed = ASSUMED_EGO_SPEED
                 else:
                     ego_speed = ASSUMED_EGO_SPEED
                 
-                # Calculate safe distance based on your speed
-                # Rule: 1 second per 10 km/h (simplified 2-second rule)
                 ego_speed_kmh = ego_speed * 3.6
-                safe_distance = max(10.0, ego_speed_kmh / 3.6 * 2.0)  # 2-second rule
+                safe_distance = max(10.0, ego_speed_kmh / 3.6 * 2.0)
                 
-                # Adjust TTC thresholds based on ego speed
-                if ego_speed_kmh > 80:  # Highway speeds
-                    critical_ttc = 2.0
-                    warning_ttc = 4.0
-                elif ego_speed_kmh > 50:  # City fast
-                    critical_ttc = 1.5
-                    warning_ttc = 3.0
-                else:  # City slow
-                    critical_ttc = 1.0
-                    warning_ttc = 2.0
+                ttc = collision_det.calculate_ttc(distance, abs(relative_speed))
                 
-                # ========== FACTOR 4: LOW SPEED FILTER ==========
-                # If approaching too slowly, always safe
-                if relative_speed < MIN_DANGER_SPEED:
-                    status_text = "SAFE"
-                    text_color = (0, 255, 0)
-                    box_color = (0, 255, 0)
-                    stats['safe'] += 1
+                danger_level, box_color = collision_det.assess_danger(
+                    ttc, relative_speed, distance, safe_distance
+                )
                 
-                # ========== COMBINED DANGER ASSESSMENT ==========
-                elif relative_speed >= MIN_DANGER_SPEED:
-                    # Vehicle approaching fast enough to matter
-                    
-                    # Check if distance is too small regardless of TTC
-                    if distance < safe_distance * 0.5:
-                        # Very close - critical
-                        status_text = "DANGER"
-                        text_color = (0, 0, 255)
-                        box_color = (0, 0, 255)
-                        stats['critical'] += 1
-                    
-                    elif ttc < critical_ttc:
-                        # Critical TTC
-                        status_text = "DANGER"
-                        text_color = (0, 0, 255)
-                        box_color = (0, 0, 255)
-                        stats['critical'] += 1
-                    
-                    elif ttc < warning_ttc or distance < safe_distance:
-                        # Warning TTC or below safe distance
-                        status_text = "WARNING"
-                        text_color = (0, 165, 255)
-                        box_color = (0, 165, 255)
-                        stats['warnings'] += 1
-                    
-                    elif relative_speed < SLOW_SPEED_THRESHOLD:
-                        # Approaching slowly
-                        status_text = "CAUTION"
-                        text_color = (0, 255, 255)
-                        box_color = (0, 255, 255)
-                        stats['warnings'] += 1
-                    
-                    else:
-                        # Safe
-                        status_text = "SAFE"
-                        text_color = (0, 255, 0)
-                        box_color = (0, 255, 0)
-                        stats['safe'] += 1
+                danger_level = collision_det.apply_temporal_hysteresis(track_id_int, danger_level)
                 
+                if danger_level == "CRITICAL":
+                    stats['critical'] += 1
+                elif danger_level in ["WARNING", "CAUTION"]:
+                    stats['warnings'] += 1
                 else:
-                    # Not approaching
-                    status_text = "SAFE"
-                    text_color = (0, 255, 0)
-                    box_color = (0, 255, 0)
                     stats['safe'] += 1
                 
                 stats['total_detections'] += 1
                 
-                # ========== VISUALIZATION ==========
-                # Draw bounding box
+                if danger_level == "CRITICAL":
+                    box_color = (0, 0, 255)
+                    status_text = "DANGER"
+                elif danger_level == "WARNING":
+                    box_color = (0, 165, 255)
+                    status_text = "WARNING"
+                elif danger_level == "CAUTION":
+                    box_color = (0, 255, 255)
+                    status_text = "CAUTION"
+                else:
+                    box_color = (0, 255, 0)
+                    status_text = "SAFE"
+                
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), 
                             box_color, 3)
                 
-                # Status label
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 0.7
                 thickness = 2
@@ -296,7 +311,6 @@ def process_collision_video(video_path, model_path, focal_length=1200, progress_
                 
                 y_pos = int(y1) - 15
                 
-                # Black background
                 cv2.rectangle(
                     frame,
                     (int(x1), y_pos - text_height - 10),
@@ -305,10 +319,9 @@ def process_collision_video(video_path, model_path, focal_length=1200, progress_
                     -1
                 )
                 
-                # Status text
                 cv2.putText(
                     frame, status_text, (int(x1) + 5, y_pos),
-                    font, font_scale, text_color, thickness
+                    font, font_scale, box_color, thickness
                 )
         
         out.write(frame)
@@ -831,25 +844,13 @@ with tabs[4]:
         else:
             st.error("No test images found!")
 
-with tabs[5]:  # Collision Detection Tab
+with tabs[5]: 
     st.header("🚗 Road Safety System")
     st.markdown("""
     Upload a dashcam video to detect vehicles and assess collision risks.
-    The system will:
-    - Detect and track vehicles (cars, trucks, buses, motorcycles)
-    - Estimate distance to each vehicle
-    - Calculate approaching speed
-    - Compute Time-to-Collision (TTC)
-    - Provide color-coded warnings:
-      - 🟢 **Green**: Safe
-      - 🟡 **Yellow**: Caution
-      - 🟠 **Orange**: Warning (TTC < 3s)
-      - 🔴 **Red**: Critical (TTC < 1.5s)
     """)
     
     st.divider()
-    
-    # File uploader
     uploaded_video = st.file_uploader(
         "Upload Dashcam Video",
         type=['mp4', 'mov', 'avi'],
@@ -876,14 +877,12 @@ with tabs[5]:  # Collision Detection Tab
         )
     
     if uploaded_video and process_button:
-        # Save uploaded video to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
             tmp_file.write(uploaded_video.read())
             temp_video_path = tmp_file.name
         
         st.info("🔄 Processing video... This may take a few minutes.")
         
-        # Progress bar
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -892,7 +891,6 @@ with tabs[5]:  # Collision Detection Tab
             status_text.text(f"Processing: {int(progress*100)}%")
         
         try:
-            # Process video
             output_path, stats = process_collision_video(
                 temp_video_path,
                 'runs/detect/train7/weights/best.pt',
@@ -904,7 +902,6 @@ with tabs[5]:  # Collision Detection Tab
             
             st.success("✅ Video processed successfully!")
             
-            # Display statistics
             st.subheader("📊 Detection Statistics")
             metric_col1, metric_col2, metric_col3 = st.columns(3)
             
@@ -919,22 +916,18 @@ with tabs[5]:  # Collision Detection Tab
             
             st.divider()
             
-            # Display output video
             st.subheader("🎥 Processed Video")
             
             with open(output_path, 'rb') as video_file:
                 video_bytes = video_file.read()
                 st.video(video_bytes)
             
-            # Download button
             st.download_button(
                 label="💾 Download Processed Video",
                 data=video_bytes,
                 file_name="collision_detection_output.mp4",
                 mime="video/mp4"
             )
-            
-            # Cleanup
             os.unlink(temp_video_path)
             os.unlink(output_path)
             
@@ -944,25 +937,3 @@ with tabs[5]:  # Collision Detection Tab
     
     elif not uploaded_video:
         st.info("👆 Upload a dashcam video to get started")
-        
-        # Show example/demo
-        st.subheader("📖 How it Works")
-        st.markdown("""
-        **Distance Estimation:**
-        - Uses bounding box height and camera focal length
-        - Formula: `Distance = (Real Height × Focal Length) / Pixel Height`
-        
-        **Speed Calculation:**
-        - Tracks distance change over time
-        - Positive speed = vehicle approaching
-        
-        **Time-to-Collision (TTC):**
-        - Formula: `TTC = Distance / Speed`
-        - Warns when TTC is dangerously low
-        
-        **Color Coding:**
-        - Safe (Green): TTC > 5s or not approaching
-        - Caution (Yellow): 3s < TTC < 5s
-        - Warning (Orange): 1.5s < TTC < 3s
-        - Critical (Red): TTC < 1.5s
-        """)
